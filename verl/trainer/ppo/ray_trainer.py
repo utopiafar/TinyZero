@@ -16,6 +16,23 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+# ==============================================================================
+# RayPPOTrainer - PPO训练器的核心实现
+# ==============================================================================
+# 本模块实现了基于Ray分布式框架的PPO(Proximal Policy Optimization)训练器。
+# 主要特点:
+#   1. 使用Ray进行分布式计算,支持多机多卡训练
+#   2. 支持Hybrid Engine: Actor和Rollout共享参数
+#   3. 支持多种优势估计方法: GAE和GRPO
+#   4. 支持KL散度惩罚,防止策略偏离参考策略太远
+#   5. 支持序列长度平衡,优化训练效率
+#
+# 核心组件:
+#   - Role: 定义不同角色的枚举(Actor, Critic, RefPolicy等)
+#   - ResourcePoolManager: 管理Ray资源池
+#   - RayPPOTrainer: 主训练器类
+# ==============================================================================
+
 import os
 import uuid
 from contextlib import contextmanager
@@ -40,7 +57,18 @@ WorkerType = Type[Worker]
 
 class Role(Enum):
     """
-    To create more roles dynamically, you can subclass Role and add new members
+    定义分布式训练中不同角色的枚举类
+
+    角色说明:
+    - Actor: 策略模型,负责生成响应
+    - Rollout: 推理引擎(vLLM),负责高效生成
+    - ActorRollout: Actor和Rollout的混合体(Hybrid Engine)
+    - Critic: 价值模型,用于估计状态价值(GAE方法)
+    - RefPolicy: 参考策略,用于计算KL散度
+    - RewardModel: 奖励模型
+    - ActorRolloutRef: Actor + Rollout + RefPolicy的组合
+
+    可以通过继承此类来动态添加更多角色
     """
     Actor = 0
     Rollout = 1
@@ -54,14 +82,30 @@ class Role(Enum):
 @dataclass
 class ResourcePoolManager:
     """
-    Define a resource pool specification. Resource pool will be initialized first.
-    Mapping
+    资源池管理器 - 定义和管理Ray资源池的规范
+
+    资源池是Ray中一组计算资源的集合,可以是多台机器上的GPU。
+    本类负责:
+    1. 根据配置创建资源池
+    2. 将不同角色映射到对应的资源池
+
+    Attributes:
+        resource_pool_spec: 资源池规格,如 {'pool1': [4, 4]} 表示2个节点各4个GPU
+        mapping: 角色到资源池名称的映射
+        resource_pool_dict: 存储创建后的RayResourcePool对象
     """
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[Role, str]
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
+        """创建Ray资源池
+
+        为每个resource_pool_spec中定义的资源池创建RayResourcePool对象。
+        max_colocate_count参数说明:
+        - FSDP后端: 建议设为1,将所有WorkerGroup合并为一个
+        - Megatron后端: 可以设为>1,为不同模型使用不同WorkerGroup
+        """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
@@ -82,6 +126,21 @@ from verl.utils.torch_functional import masked_mean
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+    """
+    应用KL散度惩罚到奖励上
+
+    KL惩罚是PPO训练中的关键组件,用于防止当前策略(ref_policy)偏离参考策略太远。
+    计算方式: reward = score - beta * KL
+
+    Args:
+        data: 包含responses, scores, log_probs等的数据批次
+        kl_ctrl: KL控制器(固定或自适应)
+        kl_penalty: KL惩罚类型('kl', 'abs', 'mse'等)
+
+    Returns:
+        data: 添加了token_level_rewards的数据
+        metrics: 包含当前KL值和KL系数的指标
+    """
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -114,6 +173,23 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+    """
+    计算优势函数(Advantage)
+
+    支持的优势估计方法:
+    1. GAE (Generalized Advantage Estimation): 使用Critic估计的价值
+    2. GRPO (Group Relative Policy Optimization): 组内归一化,无需Critic
+
+    Args:
+        data: 数据批次
+        adv_estimator: 优势估计器类型('gae'或'grpo')
+        gamma: 折扣因子
+        lam: GAE lambda参数
+        num_repeat: 每个prompt生成的样本数
+
+    Returns:
+        data: 添加了advantages和returns的数据
+    """
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -170,6 +246,24 @@ def _compute_response_info(batch):
 
 
 def compute_data_metrics(batch, use_critic=True):
+    """
+    计算训练数据的各种统计指标
+
+    包括:
+    - Score统计: mean, max, min
+    - Reward统计: mean, max, min
+    - Advantage统计: mean, max, min
+    - Returns统计: mean, max, min
+    - Value统计(如果使用Critic): mean, max, min, vf_explained_var
+    - 序列长度统计: prompt_length, response_length
+
+    Args:
+        batch: 数据批次
+        use_critic: 是否使用Critic模型
+
+    Returns:
+        metrics: 包含各种统计指标的字典
+    """
     # TODO: add response length
     sequence_score = batch.batch['token_level_scores'].sum(-1)
     sequence_reward = batch.batch['token_level_rewards'].sum(-1)
@@ -258,6 +352,19 @@ def compute_data_metrics(batch, use_critic=True):
 
 
 def compute_timing_metrics(batch, timing_raw):
+    """
+    计算时间性能指标
+
+    将原始时间转换为每token的毫秒数,便于性能分析。
+    不同的操作阶段(gen, ref, values等)使用不同的token数量计算。
+
+    Args:
+        batch: 数据批次
+        timing_raw: 原始时间字典
+
+    Returns:
+        包含时间指标的字典
+    """
     response_info = _compute_response_info(batch)
     num_prompt_tokens = torch.sum(response_info['prompt_length']).item()
     num_response_tokens = torch.sum(response_info['response_length']).item()
@@ -290,7 +397,24 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 
 class RayPPOTrainer(object):
     """
-    Note that this trainer runs on the driver process on a single CPU/GPU node.
+    RayPPOTrainer - 基于Ray的PPO训练器
+
+    这是PPO训练的核心类,管理整个训练流程。特点:
+    1. 运行在driver进程上(单CPU/GPU节点)
+    2. 通过RPC调用WorkerGroup的计算函数来构建PPO数据流
+    3. 轻量级的优势计算在driver进程上执行
+    4. 支持验证和checkpoint保存
+
+    训练流程(在fit方法中):
+    1. 生成响应(generate_sequences)
+    2. 计算参考策略的log_prob(ref_policy)
+    3. 计算价值估计(critic)
+    4. 计算奖励(reward_fn + reward_model)
+    5. 应用KL惩罚
+    6. 计算优势
+    7. 更新Critic
+    8. 更新Actor(带warmup)
+    9. 验证和保存checkpoint
     """
 
     # TODO: support each role have individual ray_worker_group_cls,
@@ -303,6 +427,18 @@ class RayPPOTrainer(object):
                  ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
                  reward_fn=None,
                  val_reward_fn=None):
+        """
+        初始化RayPPOTrainer
+
+        Args:
+            config: 训练配置
+            tokenizer: 分词器
+            role_worker_mapping: 角色到Worker类的映射
+            resource_pool_manager: 资源池管理器
+            ray_worker_group_cls: Ray Worker Group类
+            reward_fn: 奖励函数(训练用)
+            val_reward_fn: 验证奖励函数
+        """
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
@@ -340,6 +476,12 @@ class RayPPOTrainer(object):
         self._create_dataloader()
 
     def _create_dataloader(self):
+        """
+        创建训练和验证数据加载器
+
+        使用RLHFDataset加载parquet格式的训练数据。
+        自动计算total_training_steps并注入到optimizer配置中。
+        """
         from torch.utils.data import DataLoader
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
@@ -390,6 +532,15 @@ class RayPPOTrainer(object):
             self.config.critic.optim.total_training_steps = total_training_steps
 
     def _validate(self):
+        """
+        在验证集上评估模型性能
+
+        使用val_reward_fn计算验证得分。
+        支持按data_source分组统计reward。
+
+        Returns:
+            metric_dict: 按data_source分组的验证指标
+        """
         reward_tensor_lst = []
         data_source_lst = []
         for test_data in self.val_dataloader:
@@ -442,7 +593,17 @@ class RayPPOTrainer(object):
         return metric_dict
 
     def init_workers(self):
-        """Init resource pool and worker group"""
+        """
+        初始化资源池和Worker组
+
+        这是分布式训练的关键初始化步骤:
+        1. 创建资源池
+        2. 根据配置创建各种Worker类(ActorRollout, Critic, RefPolicy, RewardModel)
+        3. 使用create_colocated_worker_cls合并同资源池的Worker
+        4. 初始化各Worker的模型
+
+        注意: rollout应在最后创建,以便vLLM更好地估计KV cache内存
+        """
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -514,6 +675,11 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _save_checkpoint(self):
+        """
+        保存模型checkpoint
+
+        保存Actor和Critic(如果使用)的权重到本地和可选的HDFS路径。
+        """
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
                                         f'global_step_{self.global_steps}')
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
@@ -528,7 +694,20 @@ class RayPPOTrainer(object):
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        """
+        重新排序批次数据以平衡各DP rank的token数量
+
+        根据序列长度将数据分区,使每个数据并行rank处理的token数大致相等。
+        这可以显著提高训练效率,但会破坏批次内数据的顺序。
+
+        注意: 使用GRPO等基于组的优势计算方法时需要特别小心,
+        因为此方法会破坏组内数据的连续性。
+
+        Args:
+            batch: 数据批次
+            metrics: 指标字典,用于记录平衡统计信息
+            logging_prefix: 日志前缀
+        """
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
@@ -546,9 +725,37 @@ class RayPPOTrainer(object):
 
     def fit(self):
         """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        PPO训练的主循环
+
+        这是整个PPO训练流程的核心方法。Driver进程通过RPC调用WorkerGroup的计算函数
+        来构建PPO数据流。轻量级的优势计算在driver进程上执行。
+
+        训练流程:
+        1. 生成响应(generate_sequences): Actor生成对prompt的响应
+        2. 为每个样本生成唯一ID(uid)
+        3. 重复batch以匹配rollout的n次采样
+        4. 序列长度平衡(_balance_batch): 优化各DP rank的负载
+        5. 计算参考策略log_prob(ref_policy): 用于KL惩罚
+        6. 计算价值估计(critic): GAE方法需要
+        7. 计算奖励(reward):
+           - 如果使用reward model,先计算RM分数
+           - 然后调用reward_fn组合规则和RM结果
+        8. 应用KL惩罚(如果未在actor中使用KL loss)
+        9. 计算优势(advantage): GAE或GRPO方法
+        10. 更新Critic(如果使用)
+        11. 更新Actor(带critic_warmup机制)
+        12. 定期验证和保存checkpoint
+        13. 记录各种metrics
+
+        计时统计:
+        - gen: 序列生成时间
+        - ref: 参考策略log_prob计算时间
+        - values: 价值估计时间
+        - adv: 奖励计算和优势估计时间
+        - update_critic: Critic更新时间
+        - update_actor: Actor更新时间
+        - testing: 验证时间
+        - save_checkpoint: checkpoint保存时间
         """
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
