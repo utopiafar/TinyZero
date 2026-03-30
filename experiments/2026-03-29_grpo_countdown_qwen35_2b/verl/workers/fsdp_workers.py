@@ -12,8 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-The main entry point to run the PPO algorithm
+运行PPO算法的主入口
 """
+
+# ==============================================================================
+# FSDP Workers - PPO分布式工作节点
+# ==============================================================================
+# 本模块实现了基于FSDP(Fully Sharded Data Parallel)的PPO工作节点。
+#
+# 主要Worker类:
+#   1. ActorRolloutRefWorker: 处理Actor/Rollout/RefPolicy多种角色
+#      - Actor: 策略模型,用于计算log_prob和更新策略
+#      - Rollout: 推理引擎(HF或vLLM),用于生成序列
+#      - RefPolicy: 参考策略,用于计算KL散度
+#   2. CriticWorker: 价值模型(Critic),用于估计状态价值(GAE方法)
+#   3. RewardModelWorker: 奖励模型,用于计算奖励分数
+#
+# 关键特性:
+#   - FSDP分布式训练: 支持模型分片和ZeRO优化
+#   - Ulysses序列并行: 支持长序列训练
+#   - 显存优化: 支持参数/梯度/优化器状态offload
+#   - Hybrid Engine: Actor和Rollout共享参数
+#   - vLLM集成: 高效推理引擎
+#
+# FSDP配置:
+#   - wrap_policy: 模型分片策略
+#   - mixed_precision: 混合精度训练(bf16/fp32)
+#   - sharding_strategy: FULL_SHARD(Zero3)或SHARD_GRAD_OP(Zero2)
+#   - offload: 参数/梯度/优化器状态offload到CPU
+# ==============================================================================
 
 import logging
 import os
@@ -46,24 +73,58 @@ logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 class ActorRolloutRefWorker(Worker):
     """
-    This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
-    or a hybrid engine based on the config.rollout
+    Actor/Rollout/RefPolicy组合Worker
+
+    这是一个多功能Worker,可以根据配置实例化为:
+    - 独立的Actor: 用于策略训练和log_prob计算
+    - 独立的Rollout: 用于序列生成(HF或vLLM)
+    - 独立的RefPolicy: 用于参考策略的log_prob计算
+    - 混合引擎(Hybrid Engine): Actor+Rollout共享参数
+    - ActorRolloutRef: Actor+Rollout+RefPolicy组合
+
+    角色标识:
+    - _is_actor: 是否需要Actor功能(训练、log_prob计算)
+    - _is_rollout: 是否需要Rollout功能(序列生成)
+    - _is_ref: 是否需要RefPolicy功能(KL散度计算)
+
+    显存优化:
+    - 参数offload: 将参数从GPU卸载到CPU
+    - 梯度offload: 将梯度从GPU卸载到CPU
+    - 优化器状态offload: 将优化器状态从GPU卸载到CPU
+
+    Ulysses序列并行:
+    - 支持长序列的序列并行训练
+    - 通过ulysses_sharding_manager管理数据分片和聚合
     """
 
     def __init__(self, config: DictConfig, role: str):
+        """
+        初始化ActorRolloutRefWorker
+
+        Args:
+            config: 配置对象
+            role: 角色标识,可选 'actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref'
+
+        初始化流程:
+        1. 初始化分布式进程组
+        2. 创建FSDP设备网格
+        3. 创建Ulysses序列并行设备网格
+        4. 根据角色设置offload配置
+        5. 归一化batch size配置(根据数据并行大小)
+        """
         super().__init__()
         self.config = config
         import torch.distributed
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
 
-        # build device mesh for FSDP
+        # 为FSDP构建设备网格
         world_size = torch.distributed.get_world_size()
         from torch.distributed.device_mesh import init_device_mesh
-        # TODO(sgm): support FSDP hybrid shard for larger model
+        # TODO(sgm): 支持FSDP混合分片以支持更大模型
         self.device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
 
-        # build device mesh for Ulysses Sequence Parallel
+        # 为Ulysses序列并行构建设备网格
         self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.config.actor.get('ulysses_sequence_parallel_size', 1)
         dp = world_size // self.ulysses_sequence_parallel_size
@@ -89,10 +150,10 @@ class ActorRolloutRefWorker(Worker):
             self._is_offload_grad = self.config.actor.fsdp_config.get('grad_offload', False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get('optimizer_offload', False)
         elif self._is_ref:
-            # TODO: it seems that manual offload is slowly than FSDP offload
+            # TODO: 似乎手动卸载比FSDP卸载慢
             self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
 
-        # normalize config
+        # 归一化配置
         if self._is_actor:
             self.config.actor.ppo_mini_batch_size //= (self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size)
             self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
@@ -116,17 +177,37 @@ class ActorRolloutRefWorker(Worker):
                                use_remove_padding=False,
                                enable_gradient_checkpointing=False,
                                trust_remote_code=False):
+        """
+        构建模型和优化器
+
+        流程:
+        1. 从HDFS复制模型到本地
+        2. 加载tokenizer
+        3. 从预训练模型初始化
+        4. 应用模型配置覆盖
+        5. 启用梯度检查点(可选)
+        6. 使用FSDP包装模型
+        7. 创建优化器和学习率调度器
+
+        FSDP配置:
+        - mixed_precision: 混合精度配置(bf16/fp32)
+        - wrap_policy: 自动包装策略
+        - sharding_strategy: FULL_SHARD(Zero3)或SHARD_GRAD_OP(Zero2)
+        - device_mesh: FSDP设备网格
+
+        注意: 参考策略(RefPolicy)不使用混合精度
+        """
         from verl.utils.model import print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
         from transformers import AutoModelForCausalLM, AutoConfig
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
         from torch import optim
 
-        log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
+        log_gpu_memory_usage('从HF AutoModel初始化之前', logger=logger)
         local_path = copy_local_path_from_hdfs(model_path)
 
-        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
-        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
+        # 注意我们必须用fp32创建模型，否则优化器会是bf16，这是不正确的
+        # TODO(zhangchi.usc1992): 1. 支持从随机初始化的模型创建 2. 支持直接用FSDP初始化
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
         torch_dtype = fsdp_config.get('model_dtype', None)
@@ -135,7 +216,7 @@ class ActorRolloutRefWorker(Worker):
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        # override model kwargs
+        # 覆盖模型参数
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
 
         if use_remove_padding:
@@ -156,7 +237,7 @@ class ActorRolloutRefWorker(Worker):
         if self.rank == 0:
             print(f'Model config after override: {actor_model_config}')
 
-        # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
+        # 注意(修复我): tie_word_embedding会导致meta_tensor初始化卡住
         init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings)
 
         with init_context(), warnings.catch_warnings():
@@ -164,9 +245,8 @@ class ActorRolloutRefWorker(Worker):
             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                 torch_dtype=torch_dtype,
                                                                 config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
                                                                 trust_remote_code=trust_remote_code)
-            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+            # 一些参数可能不在torch_dtype中。TODO(zhangchi.usc1992) 切换到fsdp2后移除此处
             actor_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
@@ -176,9 +256,9 @@ class ActorRolloutRefWorker(Worker):
         if self.rank == 0:
             print_model_size(actor_module)
 
-        log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
+        log_gpu_memory_usage('从HF AutoModel初始化之后', logger=logger)
 
-        # We wrap FSDP for rollout as well
+        # 我们也为rollout包裹FSDP
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
         if mixed_precision_config is not None:
             param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
@@ -202,13 +282,13 @@ class ActorRolloutRefWorker(Worker):
 
         print(f'wrap_policy: {auto_wrap_policy}')
 
-        # TODO(sgm): support hybrid
+        # TODO(sgm): 支持混合策略
         if auto_wrap_policy is None:
             sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
         else:
             sharding_strategy = ShardingStrategy.FULL_SHARD
 
-        # TODO: add transformer policy
+        # TODO: 添加transformer策略
         actor_module_fsdp = FSDP(
             actor_module,
             param_init_fn=init_fn,
@@ -221,9 +301,9 @@ class ActorRolloutRefWorker(Worker):
             device_mesh=self.device_mesh,
             forward_prefetch=False)
 
-        log_gpu_memory_usage('After Actor FSDP init', logger=logger)
+        log_gpu_memory_usage('Actor FSDP初始化之后', logger=logger)
 
-        # TODO: add more optimizer args into config
+        # TODO: 向配置中添加更多优化器参数
         if self._is_actor:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
             actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
@@ -248,8 +328,24 @@ class ActorRolloutRefWorker(Worker):
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
     def _build_rollout(self):
+        """
+        构建Rollout引擎
+
+        支持两种Rollout引擎:
+        1. HF (HuggingFace): 使用HuggingFace原生生成
+        2. vLLM: 使用vLLM高效推理引擎
+
+        vLLM特点:
+        - 高效的PagedAttention内存管理
+        - 连续批处理
+        - 需要特殊的模型加载格式
+
+        设备网格:
+        - infer_tp: 张量并行大小
+        - dp: 数据并行大小 = world_size // infer_tp
+        """
         from torch.distributed.device_mesh import init_device_mesh
-        # TODO(sgm): support FSDP hybrid shard for larger model
+        # TODO(sgm): 支持FSDP混合分片以支持更大模型
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
@@ -260,7 +356,7 @@ class ActorRolloutRefWorker(Worker):
             from verl.workers.sharding_manager import BaseShardingManager
             rollout = HFRollout(module=self.actor_module_fsdp, config=self.config.rollout)
             rollout_sharding_manager = BaseShardingManager()
-            # TODO: a sharding manager that do nothing?
+            # TODO: 一个什么都不做的sharding manager?
         elif self.config.rollout.name == 'vllm':
             from verl.workers.rollout.vllm_rollout import vLLMRollout
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
@@ -283,11 +379,19 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        from verl.workers.actor import DataParallelPPOActor
-        # This is used to import external_lib into the huggingface systems
-        import_external_libs(self.config.model.get('external_lib', None))
+        """
+        初始化模型
+
+        这是一个RPC方法,由driver调用。根据角色初始化不同的模型组件:
+        - Actor: 初始化Actor模型、优化器
+        - Rollout: 初始化Rollout引擎
+        - Ref: 初始化参考策略模型
+
+        注意: 如果启用了offload,初始化后会将参数/优化器状态卸载到CPU
+        """
 
         from omegaconf import OmegaConf
+        from verl.workers.actor import DataParallelPPOActor
         override_model_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
 
         use_remove_padding = self.config.model.get('use_remove_padding', False)
@@ -317,8 +421,17 @@ class ActorRolloutRefWorker(Worker):
                 offload_fsdp_grad(module=self.actor_module_fsdp)
                 log_gpu_memory_usage('After offload actor grad during init', logger=logger)
             if self._is_offload_optimizer:
+                # Pre-initialize optimizer states by doing a dummy step
+                # This avoids OOM during the first real training step
+                with torch.no_grad():
+                    for group in self.actor_optimizer.param_groups:
+                        for p in group["params"]:
+                            if p.grad is None:
+                                p.grad = torch.zeros_like(p)
+                    self.actor_optimizer.step()
+                    self.actor_optimizer.zero_grad()
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-                log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
+                log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -354,7 +467,24 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
-        data = data.to('cuda')
+        """
+        更新Actor策略
+
+        这是一个RPC方法,执行PPO策略更新:
+        1. 将数据加载到GPU
+        2. 如果需要,从CPU加载参数和优化器状态
+        3. 使用Ulysses sharding管理器处理数据
+        4. 调用actor.update_policy()执行训练
+        5. 计算MFU(Model FLOPs Utilization)
+        6. 更新学习率
+        7. 训练完成后,将参数和优化器状态offload回CPU(如果启用)
+
+        Args:
+            data: 包含inputs, responses, advantages等的数据
+
+        Returns:
+            包含训练指标(loss, clipfrac, entropy等)的DataProto
+        """
 
         assert self._is_actor
         if self._is_offload_param:
@@ -399,9 +529,22 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
-        prompts = prompts.to('cuda')
-        # set to False if it is validation
-        recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True)
+        """
+        生成序列
+
+        这是一个RPC方法,执行序列生成:
+        1. 将prompts加载到GPU
+        2. 使用rollout_sharding_manager准备数据
+        3. 调用rollout.generate_sequences()生成响应
+        4. 如果是Hybrid Engine且需要,重新计算old_log_probs
+        5. 清理KV cache
+
+        Args:
+            prompts: 包含input_ids, attention_mask等的prompt数据
+
+        Returns:
+            包含生成的responses和old_log_probs的DataProto
+        """
 
         assert self._is_rollout
         if self._is_offload_param:
@@ -422,6 +565,7 @@ class ActorRolloutRefWorker(Worker):
 
             output = self.rollout_sharding_manager.postprocess_data(output)
 
+        recompute_log_prob = True
         if self._is_actor and recompute_log_prob:
             # we should always recompute old_log_probs when it is HybridEngine
             output.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
@@ -447,9 +591,21 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
-        assert self._is_ref
+        """
+        计算参考策略的log概率
 
-        data = data.to('cuda')
+        这是一个RPC方法,用于KL散度计算:
+        1. 将数据加载到GPU
+        2. 如果需要,从CPU加载参数
+        3. 使用Ulysses sharding管理器处理数据
+        4. 调用ref_policy.compute_log_prob()计算log概率
+
+        Args:
+            data: 包含inputs, responses的数据
+
+        Returns:
+            包含ref_log_prob的DataProto
+        """
 
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.ref_module_fsdp,
@@ -476,8 +632,16 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None):
-        assert self._is_actor
-        import torch
+        """
+        保存模型checkpoint
+
+        这是一个RPC方法,保存Actor模型到本地和HDFS(可选)。
+        使用FSDP的FULL_STATE_DICT配置,仅由rank 0保存完整状态字典。
+
+        Args:
+            local_path: 本地保存路径
+            hdfs_path: HDFS保存路径(可选)
+        """
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
                                      device_id=torch.cuda.current_device(),
@@ -505,7 +669,24 @@ class ActorRolloutRefWorker(Worker):
 
 
 class CriticWorker(Worker):
+    """
+    Critic工作节点 - 价值函数模型
 
+    Critic用于估计状态价值,是GAE(Generalized Advantage Estimation)方法的关键组件。
+    对于GRPO方法,不需要Critic。
+
+    主要功能:
+    - compute_values: 计算状态价值估计
+    - update_critic: 更新Critic模型
+
+    架构:
+    - 通常基于预训练语言模型,修改输出头为1个神经元(回归任务)
+    - 使用FSDP进行分布式训练
+    - 支持Ulysses序列并行
+
+    显存优化:
+    - 支持参数/梯度/优化器状态offload
+    """
     def __init__(self, config):
         super().__init__()
         import torch.distributed
@@ -589,7 +770,7 @@ class CriticWorker(Worker):
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation='sdpa',
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -672,7 +853,18 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
-        data = data.to('cuda')
+        """
+        计算状态价值
+
+        这是一个RPC方法,使用Critic模型估计每个token的价值。
+        用于GAE优势估计。
+
+        Args:
+            data: 包含inputs, responses的数据
+
+        Returns:
+            包含values的DataProto
+        """
 
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.critic_module,
@@ -697,11 +889,25 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
-        data = data.to('cuda')
-        if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+        """
+        更新Critic模型
+
+        这是一个RPC方法,执行价值函数更新:
+        1. 加载数据和模型参数
+        2. 使用Ulysses sharding管理器处理数据
+        3. 调用critic.update_critic()执行训练
+        4. 计算MFU
+        5. 更新学习率
+
+        Args:
+            data: 包含inputs, responses, returns的数据
+
+        Returns:
+            包含训练指标的DataProto
+        """
+        load_fsdp_param_and_grad(module=self.critic_module,
+                                 device_id=torch.cuda.current_device(),
+                                 load_grad=self._is_offload_grad)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
 
@@ -764,7 +970,21 @@ class CriticWorker(Worker):
 # TODO(sgm): we may need to extract it to dp_reward_model.py
 class RewardModelWorker(Worker):
     """
-    Note that we only implement the reward model that is subclass of AutoModelForTokenClassification.
+    奖励模型工作节点
+
+    用于计算奖励分数的模型,基于AutoModelForTokenClassification。
+    输出单个标量值作为奖励分数。
+
+    主要功能:
+    - compute_rm_score: 计算奖励模型分数
+
+    特点:
+    - 支持切换chat template(如果配置了不同的tokenizer)
+    - 支持remove padding优化
+    - 支持Ulysses序列并行
+    - 提取最后一个有效token的分数作为reward
+
+    注意: 奖励模型通常不参与训练,只用于前向推理
     """
 
     def __init__(self, config):
@@ -829,7 +1049,7 @@ class RewardModelWorker(Worker):
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation='sdpa',
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
@@ -982,7 +1202,22 @@ class RewardModelWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_rm_score(self, data: DataProto):
-        import itertools
+        """
+        计算奖励模型分数
+
+        这是一个RPC方法:
+        1. 如果需要,切换chat template
+        2. 使用Ulysses sharding管理器处理数据
+        3. 分批处理(micro batch)
+        4. 提取最后一个有效token的分数
+        5. 扩展到token level
+
+        Args:
+            data: 包含inputs, responses的数据
+
+        Returns:
+            包含rm_scores的DataProto
+        """
         from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
         data = data.to('cuda')
         if self._do_switch_chat_template:

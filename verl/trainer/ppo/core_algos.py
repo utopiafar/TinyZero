@@ -13,29 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-PPO算法的核心函数实现。
-本文件中的函数用于支持不同分布式策略的trainer来实现PPO算法。
+Core functions to implement PPO algorithms.
+The function implemented in this file should be used by trainer with different distributed strategies to
+implement PPO
 """
-
-# ==============================================================================
-# PPO核心算法模块
-# ==============================================================================
-# 本模块实现了PPO(Proximal Policy Optimization)算法的核心组件:
-#
-# 主要组件:
-#   1. KL控制器: AdaptiveKLController(自适应), FixedKLController(固定)
-#   2. 优势估计: GAE (Generalized Advantage Estimation)
-#   3. GRPO优势: Group Relative Policy Optimization (无需Critic)
-#   4. 策略损失: PPO clipped surrogate loss
-#   5. 价值损失: Value function loss with clipping
-#   6. 熵损失:   鼓励探索
-#   7. KL惩罚:   多种KL散度计算方式
-#
-# 参考:
-#   - PPO: https://arxiv.org/abs/1707.06347
-#   - GAE: https://arxiv.org/abs/1506.02438
-#   - GRPO: https://arxiv.org/abs/2402.03300
-# ==============================================================================
 
 import numpy as np
 import torch
@@ -46,15 +27,8 @@ import verl.utils.torch_functional as verl_F
 
 class AdaptiveKLController:
     """
-    自适应KL控制器
-
-    根据当前KL散度与目标KL散度的差距,动态调整KL系数。
-    当实际KL > 目标KL时,增加KL系数以加强约束;
-    当实际KL < 目标KL时,减小KL系数以放松约束。
-
-    更新公式: coef = coef * (1 + clip(KL/target-1, -0.2, 0.2) * n_steps/horizon)
-
-    参考: https://arxiv.org/pdf/1909.08593.pdf
+    Adaptive KL controller described in the paper:
+    https://arxiv.org/pdf/1909.08593.pdf
     """
 
     def __init__(self, init_kl_coef, target_kl, horizon):
@@ -70,12 +44,7 @@ class AdaptiveKLController:
 
 
 class FixedKLController:
-    """
-    固定KL控制器
-
-    使用固定的KL系数,不随训练过程调整。
-    适用于KL惩罚较稳定或不需要动态调整的场景。
-    """
+    """Fixed KL controller."""
 
     def __init__(self, kl_coef):
         self.value = kl_coef
@@ -100,31 +69,26 @@ def get_kl_controller(config):
 
 def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torch.Tensor, eos_mask: torch.Tensor,
                                  gamma: torch.Tensor, lam: torch.Tensor):
-    """
-    使用GAE(Generalized Advantage Estimation)计算优势和回报
-
-    GAE结合了TD方法和蒙特卡洛方法的优势,通过lambda参数控制偏差-方差权衡。
-    当lam=0时,等价于TD(0); 当lam=1时,等价于蒙特卡洛方法。
-
-    计算过程:
-    1. 从后向前遍历时间步
-    2. 计算TD误差: delta = r_t + gamma * V(s_{t+1}) - V(s_t)
-    3. 累积优势: A_t = delta_t + gamma * lam * A_{t+1}
-    4. 回报 = 优势 + 价值
-    5. 对优势进行白化(whiten)归一化
+    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
 
     Args:
-        token_level_rewards: 每个token的奖励, shape: (bs, response_length)
-        values: Critic预测的价值, shape: (bs, response_length)
-        eos_mask: EOS标记掩码, shape: (bs, response_length)
-        gamma: 折扣因子
-        lam: GAE lambda参数
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        values: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length). [EOS] mask. The token after [EOS] have mask zero.
+        gamma: `(float)`
+            discounted factor used in RL
+        lam: `(float)`
+            lambda value when computing Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
 
     Returns:
-        advantages: 优势估计, shape: (bs, response_length)
-        returns: 回报, shape: (bs, response_length)
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
 
-    参考: https://arxiv.org/abs/1506.02438
     """
     with torch.no_grad():
         lastgaelam = 0
@@ -143,33 +107,25 @@ def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torc
     return advantages, returns
 
 
-# NOTE(sgm): 本实现仅考虑结果监督,其中奖励是标量。
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,
                                    epsilon: float = 1e-6):
     """
-    GRPO(Group Relative Policy Optimization)优势计算
-
-    GRPO是一种无需Critic模型的优势估计方法,核心思想是:
-    1. 对每个prompt生成多个responses(组)
-    2. 在组内进行相对奖励归一化
-    3. 优势 = (reward - group_mean) / (group_std + epsilon)
-
-    这种方法避免了训练单独的Critic模型,减少了内存和计算开销。
-    适用于结果监督(每个response只有一个标量奖励)的场景。
-
+    Compute advantage for GRPO, operating only on Outcome reward 
+    (with only one scalar reward for each response).
     Args:
-        token_level_rewards: 每个token的奖励, shape: (bs, response_length)
-        eos_mask: EOS标记掩码, shape: (bs, response_length)
-        index: 组标识符,相同index的样本属于同一组
-        epsilon: 数值稳定性常数
-
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    
     Returns:
-        advantages: 优势估计, shape: (bs, response_length)
-        returns: 回报(与advantages相同), shape: (bs, response_length)
-
-    参考: https://arxiv.org/abs/2402.03300
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
     """
     response_length = token_level_rewards.shape[-1]
     non_zero_mask = (token_level_rewards != 0)
@@ -200,45 +156,31 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
 
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
-    """
-    计算带KL惩罚的奖励
-
-    reward = score - KL(current_policy, ref_policy) * kl_ratio
-
-    Args:
-        token_level_scores: 原始奖励分数
-        old_log_prob: 当前策略的log概率
-        ref_log_prob: 参考策略的log概率
-        kl_ratio: KL惩罚系数
-
-    Returns:
-        带KL惩罚的奖励
-    """
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio
 
 
 def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
-    """
-    计算PPO策略损失(Clipped Surrogate Objective)
-
-    PPO通过裁剪概率比率来限制策略更新幅度,防止策略变化过大。
-    损失函数: L^CLIP = -E[min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t)]
-    其中 r_t = exp(log_prob - old_log_prob) 是新旧策略的概率比
+    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
 
     Args:
-        old_log_prob: 旧策略的log概率, shape: (bs, response_length)
-        log_prob: 新策略的log概率, shape: (bs, response_length)
-        advantages: 优势估计, shape: (bs, response_length)
-        eos_mask: EOS标记掩码, shape: (bs, response_length)
-        cliprange: PPO裁剪范围ε
+        old_log_prob: `(torch.Tensor)`
+            shape: (bs, response_length)
+        log_prob: `(torch.Tensor)`
+            shape: (bs, response_length)
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        cliprange: (float)
+            The clip range used in PPO. See https://arxiv.org/abs/1707.06347
 
     Returns:
-        pg_loss: 策略梯度损失(标量)
-        pg_clipfrac: 被裁剪的样本比例
-        ppo_kl: 近似KL散度
+        pg_loss: `a scalar torch.Tensor`
+            policy gradient loss computed via PPO
+        pg_clipfrac: (float)
+            a float number indicating the fraction of policy gradient loss being clipped
 
-    参考: https://arxiv.org/abs/1707.06347
     """
     negative_approx_kl = log_prob - old_log_prob
     ratio = torch.exp(negative_approx_kl)
@@ -253,48 +195,41 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
 
 
 def compute_entropy_loss(logits, eos_mask):
-    """
-    计算策略的熵损失
-
-    熵损失鼓励策略保持探索性,避免过早收敛到确定性策略。
-    H(π) = -Σ p(a) * log p(a)
-
-    在PPO中,通常会给熵损失一个较小的负权重(如0.01),作为探索奖励。
+    """Compute Categorical entropy loss
 
     Args:
-        logits: 模型输出的logits, shape: (bs, response_length, vocab_size)
-        eos_mask: EOS标记掩码, shape: (bs, response_length)
+        logits: `(torch.Tensor)`
+            shape: (bs, response_length, vocab_size)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
 
     Returns:
-        entropy: 平均熵损失(标量)
+        entropy: a scalar torch.Tensor
+
     """
-    # 计算熵
+    # compute entropy
     entropy = verl_F.entropy_from_logits(logits)  # (bs, response_len)
     entropy_loss = verl_F.masked_mean(entropy, mask=eos_mask)
     return entropy_loss
 
 
 def compute_value_loss(vpreds, returns, values, eos_mask, cliprange_value):
-    """
-    计算价值函数损失(Critic Loss)
-
-    使用裁剪的价值损失来稳定Critic训练:
-    1. 对预测值进行裁剪: clip(vpreds, values-cliprange, values+cliprange)
-    2. 计算两种MSE损失: 原始预测vs裁剪后预测
-    3. 取较大者作为最终损失
-
-    这种裁剪机制类似于PPO的策略裁剪,防止Critic更新过快。
+    """Compute the value loss. Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1151
 
     Args:
-        vpreds: Critic预测的新价值, shape: (batch_size, response_length)
-        values: Critic预测的旧价值, shape: (batch_size, response_length)
-        returns: 实际回报(目标), shape: (batch_size, response_length)
-        eos_mask: EOS标记掩码
-        cliprange_value: 价值裁剪范围
+        vpreds (`torch.FloatTensor`):
+            Predicted values of the value head, shape (`batch_size`, `response_length`)
+        values (`torch.FloatTensor`):
+            Old values of value head, shape (`batch_size`, `response_length`)
+        returns: (`torch.FloatTensor`):
+            Ground truth returns, shape (`batch_size`, `response_length`)
 
     Returns:
-        vf_loss: 价值函数损失(标量)
-        vf_clipfrac: 被裁剪的样本比例
+        vf_loss: a scalar (`torch.FloatTensor`):
+            value function loss
+        vf_clipfrac: a float
+            The ratio of vf being clipped
+
     """
     vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
     vf_losses1 = (vpreds - returns)**2
@@ -305,30 +240,15 @@ def compute_value_loss(vpreds, returns, values, eos_mask, cliprange_value):
 
 
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
-    """
-    计算KL散度惩罚
-
-    支持多种KL惩罚计算方式:
-    - 'kl': 标准KL散度, log_prob - ref_log_prob
-    - 'abs': 绝对值KL, |log_prob - ref_log_prob|
-    - 'mse': 均方误差, 0.5 * (log_prob - ref_log_prob)^2
-    - 'low_var_kl': 低方差KL估计 (Schulman, 2020)
-
-    这些不同的KL估计方式在不同场景下有各自的优劣:
-    - 'kl': 标准实现,简单直接
-    - 'abs': 对大偏差更敏感
-    - 'mse': 更平滑的梯度
-    - 'low_var_kl': 方差更低,训练更稳定
+    """Compute KL divergence given logprob and ref_logprob.
+    Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
 
     Args:
-        logprob: 当前策略的log概率
-        ref_logprob: 参考策略的log概率
-        kl_penalty: KL惩罚类型
+        logprob:
+        ref_logprob:
 
     Returns:
-        KL散度值
 
-    参考: http://joschu.net/blog/kl-approx.html
     """
     if kl_penalty == "kl":
         return logprob - ref_logprob
@@ -339,8 +259,8 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     if kl_penalty == "mse":
         return 0.5 * (logprob - ref_logprob).square()
 
-    # J. Schulman. 近似KL散度, 2020.
-    # URL http://joschu.net/blog/kl-approx.html.
+    # J. Schulman. Approximating kl divergence, 2020.
+    # # URL http://joschu.net/blog/kl-approx.html.
     if kl_penalty == 'low_var_kl':
         kl = ref_logprob - logprob
         ratio = torch.exp(kl)
@@ -348,7 +268,7 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
         return torch.clamp(kld, min=-10, max=10)
 
     if kl_penalty == "full":
-        # 注意:这里logprob和ref_logprob应该包含词汇表中每个token的logits
+        # so, here logprob and ref_logprob should contain the logits for every token in vocabulary
         raise NotImplementedError
 
     raise NotImplementedError
