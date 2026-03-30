@@ -51,9 +51,6 @@ experiments/YYYY-MM-DD_{实验名称}/
 
 ## 数据存储规范
 
-### 存储路径说明
-- **系统盘 `/`**：用于存储所有数据和模型（30GB，当前使用量低）
-
 ### 需要持久化存储的内容
 1. **日志文件/tensorboard** → `/root/tf-logs/`
 2. **模型文件** → `~/models/`
@@ -61,6 +58,7 @@ experiments/YYYY-MM-DD_{实验名称}/
 4. **临时文件** → `~/tmp/`
 5. **实验记录** → `~/experiments/`
 6. **持久化（模型文件、checkpoint等）** -> `/root/autodl-fs`
+7. **临时文件（重启会消失）** -> `/root/autodl-tmp`
 
 ### 推荐的目录结构
 ```
